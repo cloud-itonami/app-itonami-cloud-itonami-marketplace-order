@@ -1,0 +1,98 @@
+(ns rfqops.advisor
+  "RFQAdvisor -- the contained intelligence node for the B2B sourcing
+  actor.
+
+  Four ops from a closed allowlist: opening an RFQ, receiving a
+  quote, recording a human's award, and flagging an RFQ concern.
+
+  CRITICAL: every proposal's `:effect` is always `:propose`. Every
+  output is censored by `rfqops.governor` before anything is written.
+
+  What this advisor structurally cannot do: pick a winner.
+  `:receive-quote` files what a supplier offered; `:record-award`
+  carries the buyer-side human's decision through. There is no code
+  path that reads quotes and returns a winner — ranking one is
+  `marketplace.rfq/rank-quotes`' pure job, and awarding stays human.
+
+  Deterministic mock so the actor graph runs offline; in production this
+  calls a real LLM with the same proposal shape."
+  (:require [marketplace.rfq :as rfq]
+            [rfqops.store :as store]))
+
+(defprotocol Advisor
+  (-advise [advisor store request] "store + request -> proposal map"))
+
+(defn- propose-open
+  [st {:keys [rfq-id patch]}]
+  (let [r (try (-> (rfq/rfq (assoc (:rfq patch) :id rfq-id))
+                   (rfq/advance-rfq :open))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    {:op       :open-rfq
+     :rfq-id   rfq-id
+     :summary  (if r
+                 (str rfq-id " を買い手 " (:rfq/buyer r) " の引き合いとして開設: "
+                      (count (:rfq/lines r)) " 明細")
+                 (str rfq-id " の引き合いを構成できない"))
+     :rationale "買い手の需要表明の開設提案のみ。供給者の選定や価格の決定は行わない。"
+     :cites    [rfq-id]
+     :effect   :propose
+     :value    {:rfq-id rfq-id :rfq r}
+     :confidence (if (and r (empty? (rfq/rfq-errors r))) 0.94 0.2)}))
+
+(defn- propose-quote
+  [st {:keys [rfq-id patch]}]
+  (let [r (store/rfq-record st rfq-id)
+        q (try (rfq/quote (assoc (:quote patch) :rfq rfq-id))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    {:op       :receive-quote
+     :rfq-id   rfq-id
+     :summary  (str rfq-id " に対する見積 "
+                    (or (:quote/id (:quote patch)) "(no id)") " の受領提案")
+     :rationale "供給者が提示した内容の受領提案のみ。内容の正誤や採用の判断は行わない。"
+     :cites    [rfq-id]
+     :effect   :propose
+     :value    {:rfq-id rfq-id :quote q}
+     :confidence (if (and r q (empty? (rfq/quote-errors r q))) 0.92 0.2)}))
+
+(defn- propose-award
+  "ALWAYS escalates -- an award moves money expectations downstream
+  (a purchase order may follow), so it is never a machine's
+  unattended call."
+  [_st {:keys [rfq-id patch]}]
+  {:op       :record-award
+   :rfq-id   rfq-id
+   :summary  (str rfq-id " に対する見積 " (or (:quote-id patch) "(no id)")
+                  " への award 記録の提案")
+   :rationale "買い手が決定した内容の記録提案のみ。見積の比較や供給者の選定は行わない。"
+   :cites    [rfq-id]
+   :effect   :propose
+   :value    {:rfq-id rfq-id :award patch}
+   :confidence (or (:confidence patch) 0.8)})
+
+(defn- propose-concern
+  [_st {:keys [rfq-id patch]}]
+  {:op       :flag-rfq-concern
+   :rfq-id   rfq-id
+   :summary  (str rfq-id " の引き合いに関する懸念フラグ: " (pr-str (:concern patch "unknown")))
+   :rationale "観察された引き合い上の懸念事実の報告のみ。原因の断定や取引の判断は行わない。"
+   :cites    [rfq-id]
+   :effect   :propose
+   :value    {:rfq-id rfq-id :concern (:concern patch)}
+   :confidence (or (:confidence patch) 0.8)})
+
+(defn mock-advisor
+  []
+  (reify Advisor
+    (-advise [_ st {:keys [op] :as req}]
+      (case op
+        :open-rfq      (propose-open st req)
+        :receive-quote (propose-quote st req)
+        :record-award  (propose-award st req)
+        :flag-rfq-concern (propose-concern st req)
+        {:op op :rfq-id (:rfq-id req) :summary "unknown op"
+         :rationale "unknown" :cites [] :effect :propose
+         :value {} :confidence 0.0}))))
+
+(defn trace [request proposal]
+  {:t :advisor-trace :op (:op request) :rfq-id (:rfq-id request)
+   :confidence (:confidence proposal)})

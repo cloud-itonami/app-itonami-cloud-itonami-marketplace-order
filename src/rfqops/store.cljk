@@ -1,0 +1,100 @@
+(ns rfqops.store
+  "SSoT for the RFQ coordination actor — the B2B sourcing seam.
+
+  The fleet had seller identity, a cross-seller catalog, listings,
+  split settlement and cross-border, but nothing that states a
+  buyer's NEED before any price exists: an RFQ has no catalog offer
+  to price from and no sub-order to advance. This store is that
+  seam, and it is deliberately narrow:
+
+    rfqs   the one thing this actor OWNS: RFQ drafts becoming open
+           calls for supply, the quotes suppliers filed against
+           them, and the award the buyer recorded. Quotes
+           accumulate inside their RFQ and are never replaced or
+           removed.
+
+  What this store does NOT hold: seller credentials (onboarding's),
+  catalog offers (the catalog's), money (settlement's), warehouse
+  tasks (fulfillment's). Supplier eligibility beyond a well-shaped
+  party id is re-derived by the actor that owns it when this RFQ
+  turns into an order — this actor never re-decides who may trade.
+
+  The ledger stays append-only."
+  (:require [marketplace.rfq :as rfq]))
+
+(defprotocol Store
+  (rfq-record [s id] "RFQ record, or nil.")
+  (all-rfq-records [s])
+  (durable? [s] "False for the test-only memory backend.")
+  (ledger [s])
+  (rfq-log [s])
+  (commit-record! [s record])
+  (append-ledger! [s fact])
+  (with-rfqs [s rfqs]))
+
+;; ----------------------------- demo data -----------------------------
+
+(def product "gtin.05449000000996")
+
+(defn demo-rfq
+  "An open RFQ with no quotes yet — the state every graph test starts
+  from before receiving supply."
+  ([] (demo-rfq "rfq-demo"))
+  ([id]
+   (-> (rfq/rfq {:id id :buyer "buyer-1"
+                 :lines [{:product product :qty 100}]
+                 :invited ["sup-acme-1"]})
+       (rfq/advance-rfq :open))))
+
+(defn demo-data
+  []
+  {:rfqs {"rfq-demo" (demo-rfq)}
+   :ledger [] :rfq-log []})
+
+;; ----------------------------- applying commits -----------------------------
+
+(defn apply-commit
+  "Pure next-state for a governor-clean commit record. The record
+  carries the proposal's inputs; the RFQ contract rebuilds the
+  value, so a stored record can never disagree with what the
+  contract would build from the same inputs."
+  [rfqs {:keys [op rfq-id value]}]
+  (case op
+    :open-rfq
+    (assoc rfqs rfq-id (assoc (:rfq value) :rfq/id rfq-id))
+
+    :receive-quote
+    (if-let [r (get rfqs rfq-id)]
+      (assoc rfqs rfq-id (rfq/add-quote r (:quote value)))
+      rfqs)
+
+    :record-award
+    (if-let [r (get rfqs rfq-id)]
+      (assoc rfqs rfq-id (rfq/record-award r (:award value)))
+      rfqs)
+
+    rfqs))
+
+;; ----------------------------- MemStore -----------------------------
+
+(defrecord MemStore [a]
+  Store
+  (rfq-record [_ id] (get-in @a [:rfqs id]))
+  (all-rfq-records [_] (sort-by :rfq/id (vals (:rfqs @a))))
+  (durable? [_] false)
+  (ledger [_] (:ledger @a))
+  (rfq-log [_] (:rfq-log @a))
+  (commit-record! [this record]
+    (swap! a (fn [s] (-> s
+                         (assoc :rfqs (apply-commit (:rfqs s) record))
+                         (update :rfq-log (fnil conj []) record))))
+    nil)
+  (append-ledger! [_ fact]
+    (swap! a update :ledger (fnil conj []) fact)
+    nil)
+  (with-rfqs [_ rfqs] (->MemStore (atom {:rfqs rfqs :ledger [] :rfq-log []}))))
+
+(defn seed-db
+  "In-memory SSoT preloaded with the demo RFQ."
+  []
+  (->MemStore (atom (demo-data))))

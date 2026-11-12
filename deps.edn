@@ -27,7 +27,7 @@
         ;; outputs; it re-implements none of their rules.
         io.github.kotoba-lang/marketplace
         {:git/url "https://github.com/kotoba-lang/kotoba.git"
-         :git/sha "7e1dbe0aece831138e6106c59d2b26375d0f60c4"
+         :git/sha "c314541f3575aa48970ff02d812eb658ccca2b52"
          :deps/root "lib/kotoba.marketplace"}
         ;; The kotobase.net client, for the HOST half only
         ;; (orderops.edge.worker): q / pull / datoms / transact with a
