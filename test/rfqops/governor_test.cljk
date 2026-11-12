@@ -1,0 +1,114 @@
+(ns rfqops.governor-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [marketplace.rfq :as rfq]
+            [rfqops.advisor :as advisor]
+            [rfqops.governor :as governor]
+            [rfqops.store :as store]))
+
+(def ctx {:actor-id "rfq-actor" :phase 3 :now "2026-06-01T00:00:00Z"})
+
+(defn- db [] (store/seed-db))
+
+(defn- advise [st op & [req]]
+  (advisor/-advise (advisor/mock-advisor) st (merge {:op op} req)))
+
+(defn- check [st op & [req]]
+  (governor/check (merge {:op op} req) ctx (advise st op req) st))
+
+(defn- open-req [id & [patch]]
+  {:rfq-id id
+   :patch {:rfq (merge {:buyer "buyer-1"
+                        :lines [{:product store/product :qty 100}]}
+                       patch)}})
+
+(defn- quote-patch [& [patch]]
+  (merge {:id "q-1" :supplier "sup-acme-1" :currency "JPY"
+          :lead-time-days 14
+          :lines [{:product store/product :qty 100 :unit-price-minor 800}]}
+         patch))
+
+(defn- receive!
+  "Receive a quote the way the graph does: the advisor builds the
+  proposal, the store commits its value."
+  [st rfq-id patch]
+  (let [p (advise st :receive-quote {:rfq-id rfq-id :patch {:quote patch}})]
+    (store/commit-record! st {:op :receive-quote :rfq-id rfq-id
+                              :value (:value p)}))
+  st)
+
+;; ───────────────────── RFQ existence ─────────────────────
+
+(deftest a-quote-naming-no-rfq-is-a-hard-block
+  (let [v (check (db) :receive-quote {:rfq-id "rfq-nope"
+                                      :patch {:quote (quote-patch)}})]
+    (is (true? (:hard? v)))
+    (is (some #{:rfq-unknown} (map :rule (:violations v))))))
+
+(deftest reusing-an-rfq-id-is-a-hard-block
+  (let [st (db)
+        v (check st :open-rfq (open-req "rfq-demo"))]
+    (is (true? (:hard? v)))
+    (is (some #{:rfq-already-exists} (map :rule (:violations v))))))
+
+;; ───────────────────── malformed input ─────────────────────
+
+(deftest a-malformed-rfq-is-a-hard-block
+  (let [v (check (db) :open-rfq
+                 (open-req "rfq-2" {:lines [{:product "not-a-product" :qty 1}]}))]
+    (is (true? (:hard? v)))
+    (is (some #{:invalid-product} (map :rule (:violations v))))))
+
+(deftest a-foreign-currency-quote-is-a-hard-block
+  (let [st (db)
+        v (check st :receive-quote
+                 {:rfq-id "rfq-demo"
+                  :patch {:quote (quote-patch {:currency "USD"})}})]
+    (is (true? (:hard? v)))
+    (is (some #{:currency-mismatch} (map :rule (:violations v))))))
+
+;; ───────────────────── effect and scope ─────────────────────
+
+(deftest an-effect-other-than-propose-is-a-hard-block
+  (let [st (db)
+        p (assoc (advise st :open-rfq (open-req "rfq-2")) :effect :actuate)
+        v (governor/check (open-req "rfq-2") ctx p st)]
+    (is (true? (:hard? v)))
+    (is (some #{:effect-not-propose} (map :rule (:violations v))))))
+
+(deftest claiming-to-have-awarded-is-a-hard-block
+  (let [st (db)
+        p (assoc (advise st :open-rfq (open-req "rfq-2"))
+                 :summary "rfq-2: awarded the contract to sup-acme-1")
+        v (governor/check (open-req "rfq-2") ctx p st)]
+    (is (true? (:hard? v)))
+    (is (some #{:scope-excluded} (map :rule (:violations v))))))
+
+(deftest legitimate-award-recording-proposals-never-self-trip-scope-exclusion
+  (testing "the mock advisor's own award-recording wording stays clear
+            of the completed-action terms, or the happy path blocks itself"
+    (let [q (rfq/quote {:id "q-1" :rfq "rfq-1" :supplier "sup-acme-1"
+                         :currency "JPY" :lead-time-days 14
+                         :lines [{:product store/product :qty 100
+                                  :unit-price-minor 800}]})
+          st (store/with-rfqs (store/seed-db)
+                              {"rfq-1" (rfq/add-quote (store/demo-rfq "rfq-1") q)})]
+      (is (false? (:hard? (check st :record-award
+                                {:rfq-id "rfq-1"
+                                 :patch {:quote-id "q-1"
+                                         :decided-by "buyer-1"}})))))))
+
+;; ───────────────────── award gate ─────────────────────
+
+(deftest an-award-without-a-named-human-is-a-hard-block
+  (let [st (receive! (store/seed-db) "rfq-demo" (quote-patch))
+        v (check st :record-award {:rfq-id "rfq-demo" :patch {:quote-id "q-1"}})]
+    (is (true? (:hard? v)))
+    (is (some #{:award-needs-human} (map :rule (:violations v))))))
+
+(deftest an-award-always-escalates-even-when-clean
+  (let [st (receive! (store/seed-db) "rfq-demo" (quote-patch))
+        v (check st :record-award {:rfq-id "rfq-demo"
+                                   :patch {:quote-id "q-1"
+                                           :decided-by "buyer-1"}})]
+    (is (false? (:hard? v)))
+    (is (true? (:escalate? v)))))

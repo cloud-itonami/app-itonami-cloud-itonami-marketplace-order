@@ -1,0 +1,90 @@
+(ns rfqops.operation-graph-test
+  "Integration tests for `rfqops.operation/build`.
+
+  The headline path is intake-only on purpose: a need is stated, a
+  supplier answers, and both land in the SSoT without any machine
+  ever naming a winner. The award still passes a human."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [rfqops.operation :as operation]
+            [rfqops.store :as store]))
+
+(def ^:private op-context {:actor-id "rfq-01" :phase 3 :now "2026-06-01T00:00:00Z"})
+
+(defn- exec
+  ([actor tid request] (exec actor tid request op-context))
+  ([actor tid request context]
+   (g/run* actor {:request request :context context} {:thread-id tid})))
+
+(defn- open! [actor tid rfq-id & [patch]]
+  (exec actor tid {:op :open-rfq :rfq-id rfq-id
+                   :patch {:rfq (merge {:buyer "buyer-1"
+                                        :lines [{:product store/product :qty 100}]}
+                                       patch)}}))
+
+(defn- quote! [actor tid rfq-id & [patch]]
+  (exec actor tid {:op :receive-quote :rfq-id rfq-id
+                   :patch {:quote (merge {:id "q-1" :supplier "sup-acme-1"
+                                           :currency "JPY" :lead-time-days 14
+                                           :lines [{:product store/product :qty 100
+                                                    :unit-price-minor 800}]}
+                                          patch)}}))
+
+(deftest opening-auto-commits-and-stores-the-need
+  (let [st (store/seed-db)
+        actor (operation/build st)
+        r (open! actor "t-open" "rfq-1")]
+    (is (= :done (:status r)))
+    (is (= :commit (:disposition (:state r))))
+    (let [rec (store/rfq-record st "rfq-1")]
+      (is (= :open (:rfq/state rec)))
+      (is (= "buyer-1" (:rfq/buyer rec))))))
+
+(deftest a-quote-joins-an-open-rfq
+  (let [st (store/seed-db)
+        actor (operation/build st)]
+    (open! actor "t-q1" "rfq-1")
+    (let [r (quote! actor "t-q2" "rfq-1")]
+      (is (= :done (:status r)))
+      (is (= :commit (:disposition (:state r))))
+      (is (= 1 (count (:rfq/quotes (store/rfq-record st "rfq-1"))))))))
+
+(deftest a-malformed-open-holds-before-anything-exists
+  (let [st (store/seed-db)
+        actor (operation/build st)
+        r (open! actor "t-bad" "rfq-9"
+                 {:lines [{:product "not-a-product" :qty 1}]})]
+    (is (= :done (:status r)) "not :interrupted — no human is asked")
+    (is (= :hold (:disposition (:state r))))
+    (is (nil? (store/rfq-record st "rfq-9")))))
+
+(deftest an-award-pauses-for-a-human-and-lands-on-approval
+  (let [st (store/seed-db)
+        actor (operation/build st)]
+    (open! actor "t-a1" "rfq-1")
+    (quote! actor "t-a2" "rfq-1")
+    (let [held (exec actor "t-award" {:op :record-award :rfq-id "rfq-1"
+                                      :patch {:quote-id "q-1"
+                                              :decided-by "buyer-1"}})]
+      (is (= :interrupted (:status held)))
+    (testing "the approver's grant commits; the award names the human"
+      (let [ok (g/run* actor {:approval {:status :approved :by "sourcing-01"}}
+                        {:thread-id "t-award" :resume? true})]
+        (is (= :done (:status ok)))
+        (is (= :commit (:disposition (:state ok))))
+        (let [rec (store/rfq-record st "rfq-1")]
+          (is (= :awarded (:rfq/state rec)))
+          (is (true? (get-in rec [:rfq/award :award/human?]))))))
+    (testing "a rejection holds and records nothing"
+      (let [st2 (store/seed-db)
+            actor2 (operation/build st2)]
+        (open! actor2 "t-r1" "rfq-1")
+        (quote! actor2 "t-r2" "rfq-1")
+        (exec actor2 "t-no" {:op :record-award :rfq-id "rfq-1"
+                             :patch {:quote-id "q-1"
+                                     :decided-by "buyer-1"}})
+        (let [no (g/run* actor2 {:approval {:status :rejected :by "sourcing-01"}}
+                         {:thread-id "t-no" :resume? true})]
+          (is (= :done (:status no)))
+          (is (= :hold (:disposition (:state no))))
+          (is (= :open (:rfq/state (store/rfq-record st2 "rfq-1"))))))))))

@@ -1,0 +1,179 @@
+(ns rfqops.governor
+  "RFQGovernor -- the compliance layer for the B2B sourcing actor.
+
+  Five HARD checks, ALL permanent, un-overridable by any human approval:
+
+    1. Unknown RFQ          -- :receive-quote / :record-award must name
+                               a stored RFQ; :open-rfq must NOT reuse an
+                               id that already exists.
+    2. RFQ not open         -- quotes join and awards land on :open
+                               RFQs only. A draft that was never opened
+                               receives nothing.
+    3. Malformed RFQ/quote  -- delegated to `marketplace.rfq/rfq-errors`
+                               and `marketplace.rfq/quote-errors`,
+                               re-derived from the STORED RFQ, never
+                               from the proposal's claims about it.
+    4. Award needs a human  -- :record-award without a named buyer-side
+                               decider is refused structurally, before
+                               any confidence or phase is consulted.
+    5. Effect not :propose  -- any other value is a claim to directly
+                               actuate outside governance.
+    6. Scope exclusion      -- any op outside the closed allowlist,
+                               plus any claim to have AWARDED, SELECTED
+                               a winner, or ORDERED/PAID. This actor
+                               records that a buyer stated a need, that
+                               suppliers answered, and that a human
+                               decided; it never performs one.
+
+  Two ESCALATE (SOFT) gates:
+    - LLM confidence below the floor.
+    - `:record-award` and `:flag-rfq-concern` ALWAYS escalate. An
+      award moves money expectations downstream (a purchase order
+      may follow), so it is never a machine's unattended call.
+
+  ## Why :open-rfq and :receive-quote may auto-commit
+
+  Opening states a need and receiving files an answer — both are
+  intake, asserting nothing about who is right or who wins. The
+  safety is that the transition table bounds what is expressible,
+  the governor re-derives RFQ/quote validity from stored state, and
+  the award — the one move with money consequences — always passes
+  a human."
+  (:require [kotoba.lang.text :as str]
+            [marketplace.rfq :as rfq]
+            [rfqops.store :as store]))
+
+(def confidence-floor 0.6)
+
+(def allowed-ops
+  "The closed proposal-op allowlist. CRITICAL: no op that awards,
+  orders or pays is EVER a member in the auto sense — `:record-award`
+  is a member only so a HUMAN decision can be recorded through
+  governance, and it always escalates."
+  #{:open-rfq :receive-quote :record-award :flag-rfq-concern})
+
+(def always-escalate-ops
+  #{:record-award :flag-rfq-concern})
+
+(def scope-excluded-terms
+  "Case-insensitive substrings marking a proposal as claiming to have
+  performed a sourcing decision or a commercial act.
+
+  CRITICAL: every term is phrased as the COMPLETED action ('awarded
+  the contract'), never a bare noun like 'award' or 'quote' — a bare
+  noun would match inside this actor's own legitimate award-recording
+  proposals (whose whole job is to talk about awards) and self-block
+  the happy path."
+  ["awarded the contract" "have awarded the" "selected the winning"
+   "chose the supplier" "have chosen the supplier"
+   "sent the purchase order" "issued the purchase order"
+   "sent the payment" "have paid the supplier"
+   "落札者を決定した" "契約を締結した" "発注を送信した"
+   "支払いを実行した" "供給者を選定した"])
+
+;; ----------------------------- checks -----------------------------
+
+(defn- rfq-of
+  "The RFQ a proposal is about: the one it carries, or the stored one
+  it names."
+  [proposal st]
+  (or (get-in proposal [:value :rfq])
+      (some->> (get-in proposal [:value :rfq-id]) (store/rfq-record st))))
+
+(defn- unknown-rfq-violations
+  [proposal st]
+  (let [id (get-in proposal [:value :rfq-id])]
+    (cond
+      (and (= :open-rfq (:op proposal)) (store/rfq-record st id))
+      [{:rule :rfq-already-exists :detail (str id " は既に存在する引き合い")}]
+
+      (and (contains? #{:receive-quote :record-award} (:op proposal))
+           (nil? (store/rfq-record st id)))
+      [{:rule :rfq-unknown :detail (str (or id "(rfq-id missing)") " は存在しない引き合い")}] )))
+
+(defn- not-open-violations
+  [proposal st]
+  (when (contains? #{:receive-quote :record-award} (:op proposal))
+    (let [r (some->> (get-in proposal [:value :rfq-id]) (store/rfq-record st))]
+      (when (and r (not= :open (:rfq/state r)))
+        [{:rule :rfq-not-open
+          :detail (str (:rfq/id r) " は :open ではないため受付できない")}]))))
+
+(defn- malformed-violations
+  [proposal st]
+  (cond
+    (= :open-rfq (:op proposal))
+    (if-let [r (get-in proposal [:value :rfq])]
+      (when-let [errs (seq (rfq/rfq-errors r))]
+        (mapv (fn [e] {:rule (:rfq.error/code e)
+                       :detail (or (:rfq.error/detail e) (name (:rfq.error/code e)))})
+              errs))
+      [{:rule :rfq-unbuildable :detail "引き合いを構成できない(買い手・明細が不正)"}])
+
+    (= :receive-quote (:op proposal))
+    (let [r (some->> (get-in proposal [:value :rfq-id]) (store/rfq-record st))
+          q (get-in proposal [:value :quote])]
+      (when (and r q)
+        (when-let [errs (seq (rfq/quote-errors r q))]
+          (mapv (fn [e] {:rule (:rfq.error/code e)
+                         :detail (or (:rfq.error/detail e) (name (:rfq.error/code e)))})
+                errs))))))
+
+(defn- award-human-violations
+  [proposal]
+  (when (= :record-award (:op proposal))
+    (let [by (get-in proposal [:value :award :decided-by])]
+      (when (str/blank? (str by))
+        [{:rule :award-needs-human
+          :detail "award の記録には買い手側の人間の指名が必須"}]))))
+
+(defn- effect-not-propose-violations [proposal]
+  (when (not= :propose (:effect proposal))
+    [{:rule :effect-not-propose
+      :detail (str ":effect は :propose のみ許可されるが " (pr-str (:effect proposal)) " が提案された")}]))
+
+(defn- text-blob [proposal]
+  (str/lower (pr-str (select-keys proposal [:op :summary :rationale :cites :value]))))
+
+(defn- scope-exclusion-violations [proposal]
+  (let [op (:op proposal)
+        blob (text-blob proposal)]
+    (cond
+      (not (contains? allowed-ops op))
+      [{:rule :op-not-allowed
+        :detail (str (pr-str op) " は許可された操作(closed allowlist)に含まれない")}]
+
+      (some #(str/includes? blob %) scope-excluded-terms)
+      [{:rule :scope-excluded
+        :detail "落札・発注・支払の実行に触れる提案は永久に禁止 -- 本 actor は事実を記録するだけ"}])))
+
+(defn check
+  "Censors an RFQAdvisor proposal. `context` supplies `:now`."
+  [_request context proposal store]
+  (let [hard (into []
+                   (concat (unknown-rfq-violations proposal store)
+                           (not-open-violations proposal store)
+                           (malformed-violations proposal store)
+                           (award-human-violations proposal)
+                           (effect-not-propose-violations proposal)
+                           (scope-exclusion-violations proposal)))
+        conf (:confidence proposal 0.0)
+        low? (< conf confidence-floor)
+        stakes? (boolean (always-escalate-ops (:op proposal)))
+        hard? (boolean (seq hard))]
+    {:ok?          (and (not hard?) (not low?) (not stakes?))
+     :violations   hard
+     :confidence   conf
+     :hard?        hard?
+     :escalate?    (and (not hard?) (or low? stakes?))
+     :high-stakes? stakes?}))
+
+(defn hold-fact [request context verdict]
+  {:t          :governor-hold
+   :op         (:op request)
+   :actor      (:actor-id context)
+   :rfq-id     (:rfq-id request)
+   :disposition :hold
+   :basis      (mapv :rule (:violations verdict))
+   :violations (:violations verdict)
+   :confidence (:confidence verdict)})
