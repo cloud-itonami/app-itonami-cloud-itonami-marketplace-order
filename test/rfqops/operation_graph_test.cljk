@@ -49,6 +49,33 @@
       (is (= :commit (:disposition (:state r))))
       (is (= 1 (count (:rfq/quotes (store/rfq-record st "rfq-1"))))))))
 
+(deftest attachments-flow-through-open-to-store
+  (testing "attachment descriptors (e.g. awai.fs/carv2 canonical bytes)
+            travel with the RFQ and land in the SSoT untouched — the
+            actor never reads the bytes, only files the descriptors"
+    (let [st (store/seed-db)
+          actor (operation/build st)
+          atts [{:attachment/digest "sha256:abc" :attachment/format "awai.fs/carv2"}
+                {:attachment/digest "sha256:def" :attachment/format "application/pdf"}]
+          r (exec actor "t-att" {:op :open-rfq :rfq-id "rfq-1"
+                                 :patch {:rfq {:buyer "buyer-1"
+                                               :lines [{:product store/product :qty 100}]
+                                               :attachments atts}}})]
+      (is (= :done (:status r)))
+      (is (= :commit (:disposition (:state r))))
+      (is (= atts (:rfq/attachments (store/rfq-record st "rfq-1")))))))
+
+(deftest an-open-with-a-bad-attachment-holds
+  (let [st (store/seed-db)
+        actor (operation/build st)
+        r (exec actor "t-attbad" {:op :open-rfq :rfq-id "rfq-9"
+                                  :patch {:rfq {:buyer "buyer-1"
+                                                :lines [{:product store/product :qty 100}]
+                                                :attachments [{:attachment/format "awai.fs/carv2"}]}}})]
+    (is (= :done (:status r)) "not :interrupted — no human is asked")
+    (is (= :hold (:disposition (:state r))))
+    (is (nil? (store/rfq-record st "rfq-9")))))
+
 (deftest a-malformed-open-holds-before-anything-exists
   (let [st (store/seed-db)
         actor (operation/build st)
